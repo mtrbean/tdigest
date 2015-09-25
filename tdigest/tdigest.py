@@ -1,4 +1,5 @@
 from __future__ import division
+from copy import deepcopy
 import numpy as np
 
 
@@ -19,6 +20,13 @@ class TDigest(object):
         self.n = 0
         self.delta = delta
         self.K = K
+
+    def __add__(self, other_digest):
+        new_digest = deepcopy(self)
+        p = np.random.permutation(other_digest.m)
+        for i in p:
+            new_digest.update(other_digest._means[i], other_digest._weights[i])
+        return new_digest
 
     @property
     def _means(self):
@@ -129,8 +137,7 @@ if __name__ == '__main__':
     for dist in dists:
         print(dist.dist.name)
         digest = TDigest()
-        x = dist.rvs(size=10000)
-        digest.batch_update(x)
+        digest.batch_update(dist.rvs(size=10000))
 
         for q in [50, 10, 90, 1, 0.1, 0.01]:
             print(q, dist.ppf(q / 100),
