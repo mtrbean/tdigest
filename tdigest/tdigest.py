@@ -1,247 +1,137 @@
-from __future__ import print_function
-
-from random import choice
-from bintrees import FastRBTree as RBTree
-import pyudorandom
-from itertools import chain
-
-class Centroid(object):
-
-    def __init__(self, mean, count):
-        self.mean = float(mean)
-        self.count = float(count)
-
-    def __repr__(self):
-        return """<Centroid: mean=%.8f, count=%d>""" % (self.mean, self.count)
-
-    def __eq__(self, other):
-        return self.mean == other.mean and self.count == other.count
-
-    def update(self, x, weight):
-        self.count += weight
-        self.mean += weight * (x - self.mean) / self.count
-        return
+from __future__ import division
+import numpy as np
 
 
 class TDigest(object):
+    """ Implementation of Ted Dunning's t-digest data structure.
+
+    The t-digest data structure is designed around computing accurate estimates
+    from either streaming data, or distributed data. These estimates are
+    percentiles, quantiles, trimmed means, etc. Two t-digests can be added,
+    making the data structure ideal for map-reduce settings.
+    """
 
     def __init__(self, delta=0.01, K=25):
-        self.C = RBTree()
+        threshold = int(K / delta) + 1
+        self.__means = np.empty(threshold)
+        self.__weights = np.zeros(threshold)
+        self.m = 0
         self.n = 0
         self.delta = delta
         self.K = K
 
-    def __add__(self, other_digest):
-        data = list(chain(self.C.values(), other_digest.C.values()))
-        new_digest = TDigest(self.delta, self.K)
-        for c in pyudorandom.items(data):
-            new_digest.update(c.mean, c.count)
+    @property
+    def _means(self):
+        return self.__means[:self.m]
 
-        return new_digest
+    @property
+    def _weights(self):
+        return self.__weights[:self.m]
 
-    def __len__(self):
-        return len(self.C)
+    def _centroid_quantile(self, i):
+        assert 0 <= i < self.m
+        d = self._weights[i] / 2 + self._weights[:max(0, i - 1)].sum()
+        assert 0 <= d <= self.n
+        return d / self.n
 
-    def __repr__(self):
-        return """<T-Digest: n=%d, centroids=%d>""" % (self.n, len(self))
+    def _sort_centroids(self):
+        idx = np.argsort(self._means)
+        self._means[:] = self._means[idx]
+        self._weights[:] = self._weights[idx]
 
-    def _add_centroid(self, centroid):
-        if centroid.mean not in self.C:
-            self.C.insert(centroid.mean, centroid)
-        else:
-            self.C[centroid.mean].update(centroid.mean, centroid.count)
-
-    def _compute_centroid_quantile(self, centroid):
-        denom = self.n
-        cumulative_sum = sum(
-            c_i.count for c_i in self.C.value_slice(-float('Inf'), centroid.mean))
-        return (centroid.count / 2. + cumulative_sum) / denom
-
-    def _update_centroid(self, centroid, x, w):
-        self.C.pop(centroid.mean)
-        centroid.update(x, w)
-        self._add_centroid(centroid)
-
-    def _find_closest_centroids(self, x):
-        try:
-            ceil_key = self.C.ceiling_key(x)
-        except KeyError:
-            floor_key = self.C.floor_key(x)
-            return [self.C[floor_key]]
-
-        try:
-            floor_key = self.C.floor_key(x)
-        except KeyError:
-            ceil_key = self.C.ceiling_key(x)
-            return [self.C[ceil_key]]
-
-        if abs(floor_key - x) < abs(ceil_key - x):
-            return [self.C[floor_key]]
-        elif abs(floor_key - x) == abs(ceil_key - x) and (ceil_key != floor_key):
-            return [self.C[ceil_key], self.C[floor_key]]
-        else:
-            return [self.C[ceil_key]]
-
-    def _theshold(self, q):
-        return 4 * self.n * self.delta * q * (1 - q)
+    def _weight_bound(self, q):
+        # return 4 * self.n * self.delta * q * (1 - q)
+        return 2 * self.n * self.delta * np.sqrt(q * (1 - q))
 
     def update(self, x, w=1):
         """
         Update the t-digest with value x and weight w.
-
         """
-        self.n += w
-
-        if len(self) == 0:
-            self._add_centroid(Centroid(x, w))
+        if w == 0:
             return
 
-        S = self._find_closest_centroids(x)
+        self.n += w
 
-        while len(S) != 0 and w > 0:
-            j = choice(list(range(len(S))))
-            c_j = S[j]
+        if self.m == 0:
+            self.m = 1
+            self._means[0] = x
+            self._weights[0] = w
+            return
 
-            q = self._compute_centroid_quantile(c_j)
-
-            # This filters the out centroids that do not satisfy the second part
-            # of the definition of S. See original paper by Dunning. 
-            if c_j.count + w > self._theshold(q):
-                S.pop(j)
-                continue
-
-            delta_w = min(self._theshold(q) - c_j.count, w)
-            self._update_centroid(c_j, x, delta_w)
-            w -= delta_w
-            S.pop(j)
-
+        i = np.abs(self._means - x).argmin()
+        q = self._centroid_quantile(i)
+        bound = self._weight_bound(q)
+        if self._weights[i] + w < bound:
+            dw = min(w, bound - self._weights[i])
+            self._weights[i] += dw
+            self._means[i] += dw * (x - self._means[i]) / self._weights[i]
+            w -= dw
         if w > 0:
-            self._add_centroid(Centroid(x, w))
-
-        if len(self) > self.K / self.delta:
+            self.m += 1
+            self._means[-1] = x
+            self._weights[-1] = w
+        if self.m > self.K / self.delta:
             self.compress()
 
-        return
-
-    def batch_update(self, values, w=1):
+    def batch_update(self, x, w=1):
         """
-        Update the t-digest with an iterable of values. This assumes all points have the 
-        same weight.
+        Update the t-digest with an iterable of values. This assumes all points
+        have the same weight.
         """
-        for x in values:
-            self.update(x, w)
-        self.compress()
-        return
+        for xx in x:
+            self.update(xx, w)
 
     def compress(self):
-        T = TDigest(self.delta, self.K)
-        C = list(self.C.values())
-        for c_i in pyudorandom.items(C):
-            T.update(c_i.mean, c_i.count)
-        self.C = T.C
+        digest = TDigest(self.delta, self.K)
+        p = np.random.permutation(self.m)
+        for i in p:
+            digest.update(self._means[i], self._weights[i])
+        self.m = digest.m
+        self._means[:] = digest.means
+        self._weights[:] = digest.weights
 
-    def percentile(self, p):
-        """ 
+    def percentile(self, q):
+        """
         Computes the percentile of a specific value in [0,100].
-
         """
-        if not (0 <= p <= 100):
-            raise ValueError("p must be between 0 and 100, inclusive.")
+        if not (0 <= q <= 100):
+            raise ValueError("q must be between 0 and 100.")
 
-        t = 0
-        p = float(p)/100.
-        p *= self.n
+        self._sort_centroids()
+        q *= self.n / 100
+        return np.interp(q, self._weights.cumsum(), self._means)
 
-        for i, key in enumerate(self.C.keys()):
-            c_i = self.C[key]
-            k = c_i.count
-            if p < t + k:
-                if i == 0:
-                    return c_i.mean
-                elif i == len(self) - 1:
-                    return c_i.mean
-                else:
-                    delta = (self.C.succ_item(key)[1].mean - self.C.prev_item(key)[1].mean) / 2.
-                return c_i.mean + ((p - t) / k - 0.5) * delta
-
-            t += k
-        return self.C.max_item()[1].mean
-
-    def quantile(self, q):
-        """ 
-        Computes the quantile of a specific value, ie. computes F(q) where F denotes
-        the CDF of the distribution. 
-
+    def cdf(self, x):
         """
-        t = 0
-        N = float(self.n)
+        Computes the quantile of a specific value, ie. computes F(q) where F
+        denotes the CDF of the distribution.
+        """
 
-        for i, key in enumerate(self.C.keys()):
-            c_i = self.C[key]
-            if i == len(self) - 1:
-                delta = (c_i.mean - self.C.prev_item(key)[1].mean) / 2.
-            else:
-                delta = (self.C.succ_item(key)[1].mean - c_i.mean) / 2.
-            z = max(-1, (q - c_i.mean) / delta)
-
-            if z < 1:
-                return t / N + c_i.count / N * (z + 1) / 2
-
-            t += c_i.count
-        return 1
+        self._sort_centroids()
+        return np.interp(x, self._means, self._weights.cumsum() / self.n,
+                         left=0, right=1)
 
     def trimmed_mean(self, p1, p2):
         """
-        Computes the mean of the distribution between the two percentiles p1 and p2.
-        This is a modified algorithm than the one presented in the original t-Digest paper. 
-
+        Computes the mean of the distribution between the two percentiles.
         """
-        if not (p1 < p2):
+        if not (0 <= p1 < p2 <= 100):
             raise ValueError("p1 must be between 0 and 100 and less than p2.")
 
-        s = k = t = 0
-        p1 /= 100.
-        p2 /= 100.
-        p1 *= self.n
-        p2 *= self.n
-        for i, key in enumerate(self.C.keys()):
-            c_i = self.C[key]
-            k_i = c_i.count
-            if p1 < t + k_i:
-                if i == 0:
-                    delta = self.C.succ_item(key)[1].mean - c_i.mean
-                elif i == len(self) - 1:
-                    delta = c_i.mean - self.C.prev_item(key)[1].mean
-                else:
-                    delta = (self.C.succ_item(key)[1].mean - self.C.prev_item(key)[1].mean) / 2.
-                nu = ((p1 - t) / k_i - 0.5) * delta
-                s += nu * k_i * c_i.mean
-                k += nu * k_i
-
-            if p2 < t + k_i:
-                return s/k
-            t += k_i
-
-        return s/k
-
+        raise NotImplementedError
 
 
 if __name__ == '__main__':
-    from numpy import random
-    import numpy as np
+    from scipy.stats.distributions import gamma, uniform
 
-    T1 = TDigest()
-    x = random.random(size=10000)
-    T1.batch_update(x)
+    dists = [uniform(0, 1), gamma(0.1, scale=10)]
 
-    print(abs(T1.percentile(50) - 0.5))
-    print(abs(T1.percentile(10) - .1))
-    print(abs(T1.percentile(90) - 0.9))
-    print(abs(T1.percentile(1) - 0.01))
-    print(abs(T1.percentile(0.1) - 0.001))
-    print(T1.trimmed_mean(0.5, 1.))
+    for dist in dists:
+        print(dist.dist.name)
+        digest = TDigest()
+        x = dist.rvs(size=10000)
+        digest.batch_update(x)
 
-
-
-
-
+        for q in [50, 10, 90, 1, 0.1, 0.01]:
+            print(q, dist.ppf(q / 100),
+                  abs(digest.percentile(q) - dist.ppf(q / 100)))
