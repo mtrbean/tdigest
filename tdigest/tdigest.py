@@ -20,6 +20,7 @@ class TDigest(object):
         self.n = 0
         self.delta = delta
         self.K = K
+        self._sorted = False
 
     def __add__(self, other_digest):
         new_digest = deepcopy(self)
@@ -43,9 +44,11 @@ class TDigest(object):
         return d / self.n
 
     def _sort_centroids(self):
-        idx = np.argsort(self._means)
-        self._means[:] = self._means[idx]
-        self._weights[:] = self._weights[idx]
+        if not self._sorted:
+            idx = np.argsort(self._means)
+            self._means[:] = self._means[idx]
+            self._weights[:] = self._weights[idx]
+        self._sorted = True
 
     def _weight_bound(self, q):
         # return 4 * self.n * self.delta * q * (1 - q)
@@ -58,6 +61,7 @@ class TDigest(object):
         if w == 0:
             return
 
+        self._sorted = False
         self.n += w
 
         if self.m == 0:
