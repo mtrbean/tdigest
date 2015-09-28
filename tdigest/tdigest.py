@@ -125,8 +125,16 @@ class TDigest(object):
         """
         if not (0 <= p1 < p2 <= 100):
             raise ValueError("p1 must be between 0 and 100 and less than p2.")
-
-        raise NotImplementedError
+        self._sort_centroids()
+        p1 /= 100
+        p2 /= 100
+        w = self._weights / self.n
+        cum_w = self._weights.cumsum() / self.n
+        i1, i2 = np.searchsorted(cum_w, [p1, p2])
+        w[i1] = cum_w[i1] - p1
+        w[i2] -= cum_w[i2] - p2
+        s = slice(i1, i2 + 1)
+        return np.dot(w[s], self._means[s]) / w[s].sum()
 
 
 if __name__ == '__main__':
